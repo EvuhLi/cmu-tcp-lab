@@ -3,3 +3,12 @@ handin.tar.gz
 __pycache__/
 *.pyc
 .vagrant/
+cwnd_logs/
+cwnd_*.csv
+# compiled binaries in challenge folders
+*/client
+*/server
+*/tests/cue_server
+*/tests/testing_server
+*/tests/unit_cc
+*/tests/unit_flow
