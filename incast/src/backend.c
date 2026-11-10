@@ -28,14 +28,46 @@
 
 #include "cmu_packet.h"
 #include "cmu_tcp.h"
+#include "lab_host.h"
 
 #define MIN(X, Y) (((X) < (Y)) ? (X) : (Y))
 
 #define SMALL_POLL_MS 10
 
-// Receiver window we can currently offer. Caller must hold recv_lock.
+// ---- Incast: receiver-driven window sharing ----
+// All receivers on this host together allow K = ceil(BDP) + MARGIN packets in
+// flight. Each connection gets K / N whole packets, and the K % N lowest-ranked
+// connections get one more. With N > K, ranks 0..K-1 get 1 packet and the
+// rest wait at 0 until someone finishes.
+#define SHARE_MARGIN_PKTS 3
+#define PROBE_INTERVAL_MS 500  // Sender: min gap between zero-window probes.
+
+// This connection's share in bytes, or -1 if lab_host has nothing for it
+// (sending sockets, or a connection that hasn't joined / has left).
+static int32_t host_share(cmu_socket_t *sock) {
+  if (sock->type != TCP_LISTENER) return -1;
+  int rank = lab_host_rank(sock);
+  int n = lab_host_active();
+  double bps = lab_host_link_bps();
+  uint32_t rtt_us = lab_host_base_rtt_us();
+  if (rank < 0 || n <= 0 || bps <= 0 || rtt_us == 0) return -1;
+
+  double bdp_pkts = bps / 8.0 * rtt_us / 1e6 / (double)MSS;
+  int k = (int)bdp_pkts;
+  if (k < bdp_pkts) k++;  // ceil
+  k += SHARE_MARGIN_PKTS;
+
+  int pkts = k / n + (rank < k % n ? 1 : 0);
+  return pkts * (int32_t)MSS;
+}
+
+// Receiver window we can currently offer: free buffer space, limited to our
+// share of the host's window. Caller must hold recv_lock.
 static uint16_t recv_window(cmu_socket_t *sock) {
-  return (uint16_t)(MAX_NETWORK_BUFFER - sock->received_len);
+  uint32_t space = (uint32_t)(MAX_NETWORK_BUFFER - sock->received_len);
+  int32_t share = host_share(sock);
+  if (share >= 0 && (uint32_t)share < space) space = (uint32_t)share;
+  return (uint16_t)space;
 }
 
 #define MAX(X, Y) (((X) > (Y)) ? (X) : (Y))
@@ -513,8 +545,12 @@ void send_window(cmu_socket_t *sock) {
     uint16_t payload_len;
     if (usable > 0 && unsent > 0) {
       payload_len = MIN(MIN((uint32_t)MSS, (uint32_t)usable), unsent);
-    } else if (rwnd_closed(sock) && in_flight == 0 && unsent > 0) {
-      payload_len = 1;  // Zero-window probe.
+    } else if (rwnd_closed(sock) && in_flight == 0 && unsent > 0 &&
+               ms_since(&(sock->last_probe)) >= PROBE_INTERVAL_MS) {
+      // Zero-window probe, at most every PROBE_INTERVAL_MS: the receiver
+      // sends a window update when our turn comes, so probes are a backstop.
+      payload_len = 1;
+      clock_gettime(CLOCK_MONOTONIC, &(sock->last_probe));
     } else {
       break;
     }
@@ -620,8 +656,18 @@ void *begin_backend(void *in) {
 
     check_timer(sock);
 
-    // Window-update ACK requested by cmu_read after a zero window reopened.
+    // Window-update ACK requested by cmu_read after a zero window reopened,
+    // or because a connection joined/left and our share changed.
     while (pthread_mutex_lock(&(sock->recv_lock)) != 0) {
+    }
+    if (sock->type == TCP_LISTENER && sock->conn_state == ESTABLISHED) {
+      unsigned v = lab_host_version();
+      if (v != sock->host_version) {
+        sock->host_version = v;
+        if (recv_window(sock) != sock->last_adv_window) {
+          sock->window_update_pending = 1;
+        }
+      }
     }
     if (sock->window_update_pending) {
       uint16_t win = recv_window(sock);

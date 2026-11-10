@@ -74,15 +74,15 @@ static int rwnd_closed(cmu_socket_t *sock) {
 // Shrink when RTT exceeds the base RTT by about 2 queued packets
 // (2 x 2.75 ms on the 4 Mbps local link).
 #define DELAY_THRESH_US 5500
-#define DELAY_CUT_NUM 3  // cwnd *= 3/4 on a delay cut.
-#define DELAY_CUT_DEN 4
-#define DELAY_WAIT_RTTS 3  // RTTs to wait after a cut before reacting again.
+#define DELAY_CUT_NUM 9  // cwnd *= 3/4 on a delay cut.
+#define DELAY_CUT_DEN 10
+#define DELAY_WAIT_RTTS 1  // RTTs to wait after a cut before reacting again.
 #define SS_RECENT 4  // Slow start: check the min of the last 4 RTT samples.
 // Outside slow start, cwnd <= (max delivery rate of the last RATE_ROUNDS
 // rounds) x base RTT + CAP_HEADROOM_PKTS packets: just enough to fill the
 // link, plus a small queue.
 #define RATE_ROUNDS 10
-#define CAP_HEADROOM_PKTS 2
+#define CAP_HEADROOM_PKTS 1
 
 // Microseconds on the monotonic clock, never 0 (0 means "no timestamp").
 static uint32_t now_us(void) {

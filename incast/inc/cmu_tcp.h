@@ -104,6 +104,9 @@ typedef struct {
   int dup_acks;
   uint32_t ca_acc;  // Bytes credited toward the next +MSS in CA.
   int fast_retx_pending;
+  // Incast: receiver-driven window sharing.
+  unsigned host_version;        // Last lab_host_version() we advertised for.
+  struct timespec last_probe;   // Sender: when we last sent a zero-window probe.
   FILE* cwnd_log;
   struct timespec log_start;
 } cmu_socket_t;

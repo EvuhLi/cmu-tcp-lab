@@ -87,6 +87,9 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->ooo_head = NULL;
   sock->last_adv_window = MAX_NETWORK_BUFFER;
   sock->window_update_pending = 0;
+  sock->host_version = 0;
+  sock->last_probe.tv_sec = 0;
+  sock->last_probe.tv_nsec = 0;
   sock->cwnd = WINDOW_INITIAL_WINDOW_SIZE;
   sock->ssthresh = WINDOW_INITIAL_SSTHRESH;
   sock->cc_state = SLOW_START;
