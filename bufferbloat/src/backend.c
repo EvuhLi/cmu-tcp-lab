@@ -74,7 +74,7 @@ static int rwnd_closed(cmu_socket_t *sock) {
 // Shrink when RTT exceeds the base RTT by about 2 queued packets
 // (2 x 2.75 ms on the 4 Mbps local link).
 #define DELAY_THRESH_US 5500
-#define DELAY_CUT_NUM 9  // cwnd *= 3/4 on a delay cut.
+#define DELAY_CUT_NUM 9  // cwnd *= 9/10 on a delay cut.
 #define DELAY_CUT_DEN 10
 #define DELAY_WAIT_RTTS 1  // RTTs to wait after a cut before reacting again.
 #define SS_RECENT 4  // Slow start: check the min of the last 4 RTT samples.
@@ -83,6 +83,10 @@ static int rwnd_closed(cmu_socket_t *sock) {
 // link, plus a small queue.
 #define RATE_ROUNDS 10
 #define CAP_HEADROOM_PKTS 1
+// Pacing: full-size packets leave one every MSS x base_rtt / cwnd (twice as
+// fast in slow start), instead of in bursts. Small packets (the game's moves)
+// are never paced. Set PACING to 0 to turn it off.
+#define PACING 1
 
 // Microseconds on the monotonic clock, never 0 (0 means "no timestamp").
 static uint32_t now_us(void) {
@@ -352,6 +356,8 @@ static void sync_send_window(cmu_socket_t *sock, uint16_t adv, uint32_t seq,
   sock->round_start_us = 0;
   sock->round_delivered = 0;
   sock->rate_n = 0;
+  sock->next_send_us = now_us();
+  sock->pace_blocked = 0;
   log_cwnd(sock, "init");
   pthread_mutex_unlock(&(sock->send_lock));
 }
@@ -647,6 +653,7 @@ void send_window(cmu_socket_t *sock) {
     }
   }
 
+  sock->pace_blocked = 0;
   while (1) {
     uint32_t in_flight =
         sock->window.next_seq_to_send - sock->window.last_ack_received;
@@ -664,6 +671,20 @@ void send_window(cmu_socket_t *sock) {
       payload_len = 1;  // Zero-window probe.
     } else {
       break;
+    }
+
+    // Pacing: a full-size packet waits until its slot.
+    int paced = PACING && payload_len == (uint16_t)MSS &&
+                sock->base_rtt_us != 0 && sock->cwnd != 0;
+    if (paced) {
+      uint32_t t = now_us();
+      int32_t early = (int32_t)(sock->next_send_us - t);  // >0: slot is ahead
+      if (early > 1000000 || early < -1000000) {
+        sock->next_send_us = t;  // Unset or stale slot: send now.
+      } else if (early > 0) {
+        sock->pace_blocked = 1;
+        break;
+      }
     }
     uint8_t *payload = sock->sending_buf + in_flight;
 
@@ -687,6 +708,17 @@ void send_window(cmu_socket_t *sock) {
     if (!sock->timer_running) {
       clock_gettime(CLOCK_MONOTONIC, &(sock->timer_start));
       sock->timer_running = 1;
+    }
+    if (paced) {
+      uint32_t c = sock->cc_state == SLOW_START ? 2 * sock->cwnd : sock->cwnd;
+      uint32_t interval =
+          (uint32_t)((uint64_t)payload_len * sock->base_rtt_us / c);
+      uint32_t t = now_us();
+      // After an idle gap, start from now (no saved-up burst).
+      if ((int32_t)(t - sock->next_send_us) > (int32_t)interval) {
+        sock->next_send_us = t;
+      }
+      sock->next_send_us += interval;
     }
     sock->window.next_seq_to_send += payload_len;
     if (after(sock->window.next_seq_to_send, sock->window.max_seq_sent)) {
@@ -758,6 +790,7 @@ void *begin_backend(void *in) {
     } else {
       wait_ms = SMALL_POLL_MS;
     }
+    if (sock->pace_blocked && wait_ms > 1) wait_ms = 1;  // Next paced slot.
     pthread_mutex_unlock(&(sock->send_lock));
 
     struct pollfd fd;

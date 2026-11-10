@@ -121,6 +121,9 @@ typedef struct {
   uint32_t round_delivered;    // Bytes newly ACKed this round.
   uint32_t rate_bps[10];       // Delivery rate (bytes/s) of the last 10 rounds.
   int rate_n;                  // Rate samples stored so far.
+  // Pacing (send_lock).
+  uint32_t next_send_us;       // Earliest time the next full packet may go.
+  int pace_blocked;            // send_window stopped early to pace.
   FILE* cwnd_log;
   struct timespec log_start;
 } cmu_socket_t;

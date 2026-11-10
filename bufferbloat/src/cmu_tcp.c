@@ -103,6 +103,8 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->round_start_us = 0;
   sock->round_delivered = 0;
   sock->rate_n = 0;
+  sock->next_send_us = 0;
+  sock->pace_blocked = 0;
   // One log per process: cwnd_logs/<program>-<role>-<pid>.csv, so the
   // many processes in a lab test don't overwrite each other.
   char log_path[256];
