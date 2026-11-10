@@ -16,6 +16,13 @@
 
 #include <errno.h>
 #include <sys/stat.h>
+#include <stdlib.h>
+
+#ifdef __APPLE__
+#define LAB_PROGNAME getprogname()
+#else
+#define LAB_PROGNAME program_invocation_short_name
+#endif
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -91,7 +98,7 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   char log_path[256];
   mkdir("cwnd_logs", 0777);
   snprintf(log_path, sizeof(log_path), "cwnd_logs/%s-%s-%d.csv",
-           program_invocation_short_name,
+           LAB_PROGNAME,
            socket_type == TCP_INITIATOR ? "initiator" : "listener",
            (int)getpid());
   sock->cwnd_log = fopen(log_path, "w");

@@ -137,7 +137,7 @@ uint8_t* create_packet(uint16_t src, uint16_t dst, uint32_t seq, uint32_t ack,
     return NULL;
   }
 
-  uint8_t* packet = malloc(sizeof(cmu_tcp_header_t) + payload_len);
+  uint8_t* packet = malloc(sizeof(cmu_tcp_header_t) + ext_len + payload_len);
   if (packet == NULL) {
     return NULL;
   }

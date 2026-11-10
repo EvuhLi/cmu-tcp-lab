@@ -54,11 +54,12 @@ static const char *cc_name(cc_state_t s) {
 
 static long ms_since(const struct timespec *start);
 
-// Appends ms,cwnd,ssthresh,state,event to the CSV. Caller holds send_lock.
+// Appends ms,cwnd,ssthresh,state,event,rtt_us,base_us to the CSV. Caller holds send_lock.
 static void log_cwnd(cmu_socket_t *sock, const char *event) {
   if (sock->cwnd_log == NULL) return;
-  fprintf(sock->cwnd_log, "%ld,%u,%u,%s,%s\n", ms_since(&(sock->log_start)),
-          sock->cwnd, sock->ssthresh, cc_name(sock->cc_state), event);
+  fprintf(sock->cwnd_log, "%ld,%u,%u,%s,%s,%u,%u\n",
+          ms_since(&(sock->log_start)), sock->cwnd, sock->ssthresh,
+          cc_name(sock->cc_state), event, sock->last_rtt_us, sock->base_rtt_us);
 }
 
 // Receiver-limited with nothing real in flight (only a probe, if anything).
@@ -69,13 +70,56 @@ static int rwnd_closed(cmu_socket_t *sock) {
   return sock->window.right_edge == sock->window.last_ack_received;
 }
 
+// ---- Delay-based congestion control parameters ----
+// Shrink when RTT exceeds the base RTT by about 2 queued packets
+// (2 x 2.75 ms on the 4 Mbps local link).
+#define DELAY_THRESH_US 5500
+#define DELAY_CUT_NUM 3  // cwnd *= 3/4 on a delay cut.
+#define DELAY_CUT_DEN 4
+#define DELAY_WAIT_RTTS 3  // RTTs to wait after a cut before reacting again.
+#define SS_RECENT 4  // Slow start: check the min of the last 4 RTT samples.
+// Outside slow start, cwnd <= (max delivery rate of the last RATE_ROUNDS
+// rounds) x base RTT + CAP_HEADROOM_PKTS packets: just enough to fill the
+// link, plus a small queue.
+#define RATE_ROUNDS 10
+#define CAP_HEADROOM_PKTS 2
+
+// Microseconds on the monotonic clock, never 0 (0 means "no timestamp").
+static uint32_t now_us(void) {
+  struct timespec t;
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  uint32_t us = (uint32_t)((uint64_t)t.tv_sec * 1000000u + t.tv_nsec / 1000);
+  return us ? us : 1;
+}
+
+// Fills the timestamp extension: our send time, then the ts we echo.
+static void make_ts_ext(uint8_t ext[TS_EXT_LEN], uint32_t echo) {
+  uint32_t ts_n = htonl(now_us());
+  uint32_t echo_n = htonl(echo);
+  memcpy(ext, &ts_n, 4);
+  memcpy(ext + 4, &echo_n, 4);
+}
+
+// Reads the timestamp extension; both are 0 if the packet has none.
+static void read_ts_ext(uint8_t *pkt, uint32_t *ts, uint32_t *echo) {
+  cmu_tcp_header_t *hdr = (cmu_tcp_header_t *)pkt;
+  *ts = 0;
+  *echo = 0;
+  if (get_extension_length(hdr) < TS_EXT_LEN) return;
+  uint32_t ts_n, echo_n;
+  memcpy(&ts_n, get_extension_data(hdr), 4);
+  memcpy(&echo_n, get_extension_data(hdr) + 4, 4);
+  *ts = ntohl(ts_n);
+  *echo = ntohl(echo_n);
+}
+
 // ssthresh = MAX(cwnd / 2, 2 * MSS). Caller holds send_lock.
 static void halve(cmu_socket_t *sock) {
   sock->ssthresh = MAX(sock->cwnd / 2, 2 * (uint32_t)MSS);
 }
 
 void handle_ack(cmu_socket_t *sock, uint32_t seq, uint32_t ack, uint16_t adv,
-                uint16_t payload_len) {
+                uint16_t payload_len, uint32_t echo) {
   while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
   }
 
@@ -110,7 +154,75 @@ void handle_ack(cmu_socket_t *sock, uint32_t seq, uint32_t ack, uint16_t adv,
 
     // Congestion control: new ACK.
     sock->dup_acks = 0;
-    if (sock->cc_state == SLOW_START) {
+    sock->round_delivered += acked;
+
+    // RTT sample from the echoed timestamp; base RTT = smallest ever seen.
+    // Within a round (one RTT), keep the smallest sample: jitter only adds
+    // delay, so the round's minimum is high only if there is a real queue.
+    if (echo != 0) {
+      uint32_t rtt = now_us() - echo;
+      sock->last_rtt_us = rtt;
+      if (sock->base_rtt_us == 0 || rtt < sock->base_rtt_us) {
+        sock->base_rtt_us = rtt;
+      }
+      if (sock->round_min_us == 0 || rtt < sock->round_min_us) {
+        sock->round_min_us = rtt;
+      }
+      sock->recent_rtt_us[sock->recent_n % SS_RECENT] = rtt;
+      sock->recent_n++;
+    }
+
+    // End of a round: the ACK passed the marker, so one RTT has gone by.
+    // Decide once per round, and count down the post-cut wait in rounds.
+    int congested = 0;
+    if (!before(ack, sock->cut_marker)) {
+      congested = sock->round_min_us != 0 &&
+                  sock->round_min_us > sock->base_rtt_us + DELAY_THRESH_US;
+      if (sock->cwnd_log != NULL) {  // Debug: one line per round end.
+        fprintf(sock->cwnd_log, "%ld,%u,%u,%s,%s,%u,%u\n",
+                ms_since(&(sock->log_start)), sock->cwnd, sock->ssthresh,
+                cc_name(sock->cc_state), congested ? "round_hi" : "round_lo",
+                sock->round_min_us, sock->base_rtt_us);
+      }
+      sock->round_min_us = 0;
+      // Delivery rate of the round that just ended.
+      uint32_t t = now_us();
+      uint32_t dur = t - sock->round_start_us;
+      if (sock->round_start_us != 0 && dur > 0) {
+        sock->rate_bps[sock->rate_n % RATE_ROUNDS] =
+            (uint32_t)((uint64_t)sock->round_delivered * 1000000u / dur);
+        sock->rate_n++;
+      }
+      sock->round_start_us = t;
+      sock->round_delivered = 0;
+      sock->cut_marker = sock->window.max_seq_sent;
+      if (sock->cut_wait > 0) sock->cut_wait--;
+    }
+
+    // Slow start doubles cwnd every round, so a once-per-round check is too
+    // late. Check on every ACK instead, using the min of the last 4 samples
+    // so a single jittery sample can't end slow start.
+    if (sock->cc_state == SLOW_START && echo != 0 &&
+        sock->recent_n >= SS_RECENT) {
+      uint32_t m = sock->recent_rtt_us[0];
+      for (int i = 1; i < SS_RECENT; i++) {
+        if (sock->recent_rtt_us[i] < m) m = sock->recent_rtt_us[i];
+      }
+      if (m > sock->base_rtt_us + DELAY_THRESH_US) congested = 1;
+    }
+
+    if (sock->cc_state != FAST_RECOVERY && congested && sock->cut_wait == 0) {
+      // Queue is building: cut to 3/4 (also ends slow start), then wait.
+      sock->cwnd = MAX(sock->cwnd / DELAY_CUT_DEN * DELAY_CUT_NUM,
+                       2 * (uint32_t)MSS);
+      sock->ssthresh = sock->cwnd;
+      sock->cc_state = CONG_AVOID;
+      sock->ca_acc = 0;
+      sock->cut_wait = DELAY_WAIT_RTTS;
+      log_cwnd(sock, "delay_cut");
+    } else if (sock->cc_state != FAST_RECOVERY && sock->cut_wait > 0) {
+      log_cwnd(sock, "wait");  // Hold cwnd while the cut takes effect.
+    } else if (sock->cc_state == SLOW_START) {
       sock->cwnd += (uint32_t)MSS;
       if (sock->cwnd >= sock->ssthresh) {
         sock->cc_state = CONG_AVOID;
@@ -131,6 +243,24 @@ void handle_ack(cmu_socket_t *sock, uint32_t seq, uint32_t ack, uint16_t adv,
       sock->cc_state = CONG_AVOID;
       sock->ca_acc = 0;
       log_cwnd(sock, "exit_fr");
+    }
+
+    // Delivery-rate cap (not in slow start, which must be free to double).
+    if (sock->cc_state == CONG_AVOID && sock->rate_n > 0 &&
+        sock->base_rtt_us != 0) {
+      int n = sock->rate_n < RATE_ROUNDS ? sock->rate_n : RATE_ROUNDS;
+      uint32_t max_rate = 0;
+      for (int i = 0; i < n; i++) {
+        if (sock->rate_bps[i] > max_rate) max_rate = sock->rate_bps[i];
+      }
+      uint32_t cap =
+          (uint32_t)((uint64_t)max_rate * sock->base_rtt_us / 1000000u) +
+          CAP_HEADROOM_PKTS * (uint32_t)MSS;
+      if (cap < 2 * (uint32_t)MSS) cap = 2 * (uint32_t)MSS;
+      if (sock->cwnd > cap) {
+        sock->cwnd = cap;
+        log_cwnd(sock, "rate_cap");
+      }
     }
   } else {
     // ack == last_ack: duplicate only if it carries no data, data is
@@ -186,9 +316,11 @@ static void send_ctrl(cmu_socket_t *sock, uint32_t seq, uint32_t ack,
   socklen_t conn_len = sizeof(sock->conn);
   uint16_t src = sock->my_port;
   uint16_t dst = ntohs(sock->conn.sin_port);
-  uint16_t hlen = sizeof(cmu_tcp_header_t);
-  uint8_t *pkt = create_packet(src, dst, seq, ack, hlen, hlen, flags, adv, 0,
-                               NULL, NULL, 0);
+  uint16_t hlen = sizeof(cmu_tcp_header_t) + TS_EXT_LEN;
+  uint8_t ext[TS_EXT_LEN];
+  make_ts_ext(ext, sock->ts_recent);
+  uint8_t *pkt = create_packet(src, dst, seq, ack, hlen, hlen, flags, adv,
+                               TS_EXT_LEN, ext, NULL, 0);
   sendto(sock->socket, pkt, hlen, 0, (struct sockaddr *)&(sock->conn),
          conn_len);
   free(pkt);
@@ -211,6 +343,15 @@ static void sync_send_window(cmu_socket_t *sock, uint16_t adv, uint32_t seq,
   sock->dup_acks = 0;
   sock->ca_acc = 0;
   sock->fast_retx_pending = 0;
+  sock->base_rtt_us = 0;
+  sock->last_rtt_us = 0;
+  sock->cut_wait = 0;
+  sock->cut_marker = sock->isn + 1;  // First round ends with the first ACK.
+  sock->round_min_us = 0;
+  sock->recent_n = 0;
+  sock->round_start_us = 0;
+  sock->round_delivered = 0;
+  sock->rate_n = 0;
   log_cwnd(sock, "init");
   pthread_mutex_unlock(&(sock->send_lock));
 }
@@ -367,8 +508,10 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
   }
 
   uint16_t payload_len = get_payload_len(pkt);
+  uint32_t pkt_ts, pkt_echo;
+  read_ts_ext(pkt, &pkt_ts, &pkt_echo);
   if (flags & ACK_FLAG_MASK) {
-    handle_ack(sock, seq, ack, adv, payload_len);
+    handle_ack(sock, seq, ack, adv, payload_len, pkt_echo);
   }
 
   if (payload_len == 0) {
@@ -386,6 +529,7 @@ void handle_message(cmu_socket_t *sock, uint8_t *pkt) {
 
   if (before(start, end)) {
     if (start == next) {
+      sock->ts_recent = pkt_ts;  // This packet advances the ACK: echo it.
       append_in_order(sock, payload + (start - seq), end - start);
       drain_ooo(sock);
     } else {
@@ -477,6 +621,7 @@ void send_window(cmu_socket_t *sock) {
   }
   uint32_t ack = sock->window.next_seq_expected;
   uint16_t adv_window = recv_window(sock);
+  uint32_t echo = sock->ts_recent;
   pthread_mutex_unlock(&(sock->recv_lock));
 
   while (pthread_mutex_lock(&(sock->send_lock)) != 0) {
@@ -487,11 +632,13 @@ void send_window(cmu_socket_t *sock) {
     sock->fast_retx_pending = 0;
     uint16_t len = MIN((uint32_t)MSS, (uint32_t)sock->sending_len);
     if (len > 0) {
-      uint16_t hlen = sizeof(cmu_tcp_header_t);
+      uint16_t hlen = sizeof(cmu_tcp_header_t) + TS_EXT_LEN;
+      uint8_t ext[TS_EXT_LEN];
+      make_ts_ext(ext, echo);
       uint8_t *msg = create_packet(
           sock->my_port, ntohs(sock->conn.sin_port),
           sock->window.last_ack_received, ack, hlen, hlen + len, ACK_FLAG_MASK,
-          adv_window, 0, NULL, sock->sending_buf, len);
+          adv_window, TS_EXT_LEN, ext, sock->sending_buf, len);
       sendto(sock->socket, msg, hlen + len, 0,
              (struct sockaddr *)&(sock->conn), conn_len);
       free(msg);
@@ -523,11 +670,12 @@ void send_window(cmu_socket_t *sock) {
     uint16_t src = sock->my_port;
     uint16_t dst = ntohs(sock->conn.sin_port);
     uint32_t seq = sock->window.next_seq_to_send;
-    uint16_t hlen = sizeof(cmu_tcp_header_t);
+    uint16_t hlen = sizeof(cmu_tcp_header_t) + TS_EXT_LEN;
     uint16_t plen = hlen + payload_len;
     uint8_t flags = ACK_FLAG_MASK;
-    uint16_t ext_len = 0;
-    uint8_t *ext_data = NULL;
+    uint16_t ext_len = TS_EXT_LEN;
+    uint8_t ext_data[TS_EXT_LEN];
+    make_ts_ext(ext_data, echo);
 
     uint8_t *msg = create_packet(src, dst, seq, ack, hlen, plen, flags,
                                  adv_window, ext_len, ext_data, payload,
@@ -589,6 +737,7 @@ static void check_timer(cmu_socket_t *sock) {
       sock->cc_state = SLOW_START;
       sock->dup_acks = 0;
       sock->fast_retx_pending = 0;
+      sock->recent_n = 0;  // Old samples shouldn't end the new slow start.
       log_cwnd(sock, "timeout");
     }
   }

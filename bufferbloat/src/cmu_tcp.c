@@ -16,6 +16,13 @@
 
 #include <errno.h>
 #include <sys/stat.h>
+#include <stdlib.h>
+
+#ifdef __APPLE__
+#define LAB_PROGNAME getprogname()
+#else
+#define LAB_PROGNAME program_invocation_short_name
+#endif
 
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -86,17 +93,27 @@ int cmu_socket(cmu_socket_t *sock, const cmu_socket_type_t socket_type,
   sock->dup_acks = 0;
   sock->ca_acc = 0;
   sock->fast_retx_pending = 0;
+  sock->ts_recent = 0;
+  sock->base_rtt_us = 0;
+  sock->last_rtt_us = 0;
+  sock->cut_wait = 0;
+  sock->cut_marker = 0;
+  sock->round_min_us = 0;
+  sock->recent_n = 0;
+  sock->round_start_us = 0;
+  sock->round_delivered = 0;
+  sock->rate_n = 0;
   // One log per process: cwnd_logs/<program>-<role>-<pid>.csv, so the
   // many processes in a lab test don't overwrite each other.
   char log_path[256];
   mkdir("cwnd_logs", 0777);
   snprintf(log_path, sizeof(log_path), "cwnd_logs/%s-%s-%d.csv",
-           program_invocation_short_name,
+           LAB_PROGNAME,
            socket_type == TCP_INITIATOR ? "initiator" : "listener",
            (int)getpid());
   sock->cwnd_log = fopen(log_path, "w");
   if (sock->cwnd_log != NULL) {
-    fprintf(sock->cwnd_log, "ms,cwnd,ssthresh,state,event\n");
+    fprintf(sock->cwnd_log, "ms,cwnd,ssthresh,state,event,rtt_us,base_us\n");
   }
   clock_gettime(CLOCK_MONOTONIC, &(sock->log_start));
 

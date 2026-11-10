@@ -104,6 +104,23 @@ typedef struct {
   int dup_acks;
   uint32_t ca_acc;  // Bytes credited toward the next +MSS in CA.
   int fast_retx_pending;
+  // Delay-based congestion control (bufferbloat).
+  uint32_t ts_recent;    // Receiver: ts to echo, from the packet that last
+                         // advanced next_seq_expected. Protected by recv_lock.
+  uint32_t base_rtt_us;  // Smallest RTT sample seen (0 = none yet). send_lock.
+  uint32_t last_rtt_us;  // Most recent RTT sample. send_lock.
+  int cut_wait;          // RTTs left to wait after a delay cut (0 = not
+                         // waiting). send_lock.
+  uint32_t cut_marker;   // Round marker: an ACK reaching this seq ends the
+                         // current round (one RTT). send_lock.
+  uint32_t round_min_us; // Smallest RTT sample this round (0 = none). send_lock.
+  uint32_t recent_rtt_us[4];  // Last 4 RTT samples (slow-start check).
+  int recent_n;               // Samples stored so far (counts up past 4).
+  // Delivery-rate cap: cwnd <= max_rate x base_rtt + headroom (send_lock).
+  uint32_t round_start_us;     // When the current round began.
+  uint32_t round_delivered;    // Bytes newly ACKed this round.
+  uint32_t rate_bps[10];       // Delivery rate (bytes/s) of the last 10 rounds.
+  int rate_n;                  // Rate samples stored so far.
   FILE* cwnd_log;
   struct timespec log_start;
 } cmu_socket_t;
